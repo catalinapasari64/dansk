@@ -1,5 +1,5 @@
 // Offline support. Bump CACHE whenever app files change so installed copies pick up the update.
-const CACHE = 'dansk-v5';
+const CACHE = 'dansk-v6';
 const ASSETS = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'icons/icon-180.png', 'icons/icon-512.png'];
 
 self.addEventListener('install', e => {

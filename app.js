@@ -569,7 +569,7 @@ function advance() {
 
 function showQuick(id, mode) {
   const q = vq; q.tick++;
-  q.p = null; q.fb = null; q.loading = false; q.card = { id, mode: mode || q.mode[id] }; q.active = id;
+  q.p = null; q.fb = null; q.hint = null; q.loading = false; q.card = { id, mode: mode || q.mode[id] }; q.active = id;
   paintQuiz();
 }
 
@@ -578,7 +578,7 @@ function showQuick(id, mode) {
 const eligibleNow = q => id => q.phase2 ? q.pending.includes(id) : !(id in q.first) && !q.quick.includes(id);
 async function nextPassage() {
   const q = vq, k = ++q.tick;
-  q.loading = true; q.p = null; q.card = null; q.fb = null; q.active = null; paintQuiz();
+  q.loading = true; q.p = null; q.card = null; q.fb = null; q.hint = null; q.active = null; paintQuiz();
   let p = null;
   if (q.next) {
     const n = q.next; q.next = null;
@@ -614,13 +614,13 @@ function paintQuiz() {
     let panel;
     if (fb && fb.checking) panel = `<div class="ans"><p class="muted">Checking your answer</p></div>`;
     else if (fb) {
-      const label = { ok: 'Correct', part: 'Partly right', bad: 'Not quite' }[fb.kind];
+      const label = fb.hinted && fb.kind === 'part' ? 'Right, with a hint' : { ok: 'Correct', part: 'Partly right', bad: 'Not quite' }[fb.kind];
       panel = `<div class="ans"><p class="verdict k-${fb.kind}">${label}</p>
         <div class="row">${spk(c.da, 'sm')}<p class="grow"><b>${esc(c.da)}</b> — ${esc(c.en)}</p></div>
-        ${fb.ans ? `<p class="muted small">You wrote “${esc(fb.ans)}”.${fb.note ? ' ' + esc(fb.note) : ''}</p>` : ''}
+        ${fb.ans ? `<p class="muted small">You ${fb.picked ? 'chose' : 'wrote'} “${esc(fb.ans)}”.${fb.note ? ' ' + esc(fb.note) : ''}</p>` : ''}
         ${c.notes ? `<p class="muted small">${esc(c.notes)}</p>` : ''}
         <button class="btn primary block" data-a="qNext">${left ? 'Next word' : 'Continue'}</button>
-        ${fb.kind !== 'ok' && fb.ans ? `<button class="btn ghost block" data-a="qOver">My answer was right</button>` : ''}</div>`;
+        ${fb.kind !== 'ok' && fb.ans && !fb.hinted ? `<button class="btn ghost block" data-a="qOver">My answer was right</button>` : ''}</div>`;
     } else {
       const ask = mode === 'context' ? `What does <b>${esc(t.form)}</b> mean here?`
         : mode === 'cloze' ? `Which Danish word is missing? It means <b>${esc(c.en)}</b>.`
@@ -629,6 +629,9 @@ function paintQuiz() {
       panel = `<div class="ans"><label for="ans">${ask}</label>
         <input id="ans" type="text" placeholder="${da ? 'Danish word' : 'English meaning'}" autocapitalize="none" autocomplete="off" lang="${da ? 'da' : 'en'}" ${da ? 'autocorrect="off" spellcheck="false"' : ''} enterkeyhint="send">
         <button class="btn primary block" data-a="qSubmit">Submit</button>
+        ${q.hint && q.hint.id === c.id
+          ? `<p class="muted small hint-note">One of these is right. With a hint the word still comes back tomorrow.</p><div class="opts">${q.hint.opts.map(o => `<button class="opt" data-a="qOpt" data-id="${o.id}">${esc(da ? o.da : o.en)}</button>`).join('')}</div>`
+          : `<button class="btn ghost block" data-a="qHint">Show a hint</button>`}
         <button class="btn ghost block" data-a="qSkip">I don't know</button></div>`;
     }
     if (p) body = `<div class="stage top read"><p class="source">${srcLine(p)}${p.targets.length > 1 ? ` · ${p.targets.length} words to answer` : ''}</p>
@@ -639,6 +642,24 @@ function paintQuiz() {
   overlay.innerHTML = ohead(Math.round(doneN / total * 100), q.phase2 ? 'second try' : `${doneN} of ${total}`) + body;
   overlay.hidden = false;
   const inp = $('#ans'); if (inp) inp.focus();
+}
+
+// A hint offers four of the user's own words, one of them the answer, in random order. An answer
+// given after a hint never counts as a successful recall.
+function showHint() {
+  const q = vq, id = q.active, c = byId(id); if (!c || q.fb || q.loading) return;
+  const inPassage = new Set(q.p ? q.p.targets.map(t => t.id) : []);
+  let others = S.custom.filter(x => x.id !== id && x.en !== c.en && termOf(x.da) !== termOf(c.da));
+  const outside = others.filter(x => !inPassage.has(x.id)); if (outside.length >= 3) others = outside;
+  if (!others.length) { toast('Add more words to your vocabulary to get hints'); return; }
+  q.hint = { id, opts: shuffle([c, ...shuffle(others).slice(0, 3)]).map(x => ({ id: x.id, da: x.da, en: x.en })) };
+  paintQuiz();
+}
+function pickHint(optId) {
+  const q = vq, id = q.active; if (!q.hint || q.hint.id !== id || q.fb) return;
+  const o = q.hint.opts.find(x => x.id === optId), mode = modeOf(q, id), right = optId === id;
+  q.fb = { id, ans: wantsDanish(mode) ? o.da : o.en, picked: true, kind: right ? 'part' : 'bad', note: right ? 'It comes back tomorrow because you used a hint.' : '', mode, hinted: true };
+  q.done[id] = q.fb.kind; paintQuiz();
 }
 
 async function submitAns(giveUp) {
@@ -654,7 +675,9 @@ async function submitAns(giveUp) {
     try { const r = await aiGrade(c, t ? t.form : '', q.p ? q.p.text : '', ans); if (r) { kind = r.verdict === 'correct' ? 'ok' : r.verdict === 'partial' ? 'part' : 'bad'; note = r.note || ''; } } catch (e) { aiFail(e); }
     if (vq !== q || q.active !== id) return;
   }
-  q.fb = { id, ans, kind, note, mode }; q.done[id] = kind; paintQuiz();
+  const hinted = !!(q.hint && q.hint.id === id);
+  if (hinted && kind === 'ok') { kind = 'part'; note = 'It comes back tomorrow because you used a hint.'; }
+  q.fb = { id, ans, kind, note, mode, hinted }; q.done[id] = kind; paintQuiz();
 }
 
 // Writes the answer on screen into the learning history. Runs when moving on, so that
@@ -662,7 +685,7 @@ async function submitAns(giveUp) {
 function commitFb() {
   const q = vq, fb = q && q.fb; if (!fb || fb.checking) return;
   const c = byId(fb.id), secondTry = fb.id in q.first;
-  if (c) record(c, fb.kind, fb.ans, q.p ? q.p.src + (q.p.url ? ': ' + q.p.title : '') : '', fb.mode, secondTry);
+  if (c) record(c, fb.kind, fb.ans + (fb.hinted && fb.ans ? ' (with a hint)' : ''), q.p ? q.p.src + (q.p.url ? ': ' + q.p.title : '') : '', fb.mode, secondTry);
   if (!secondTry) q.first[fb.id] = fb.kind;
   q.pending = q.pending.filter(x => x !== fb.id); q.quick = q.quick.filter(x => x !== fb.id);
   if (fb.kind !== 'ok' && !q.retried.has(fb.id) && c) { q.retried.add(fb.id); q.retry.push(fb.id); }
@@ -672,6 +695,7 @@ function commitFb() {
 function qNext() {
   const q = vq; commitFb();
   const nxt = q.p && q.p.targets.find(x => !q.done[x.id]);
+  q.hint = null;
   if (nxt) { q.active = nxt.id; paintQuiz(); } else advance();
 }
 
@@ -789,10 +813,12 @@ const A = {
     const q = vq; if (!q || !q.p) { if (reader && !reader.shown) { reader.shown = true; paintReader(); } return; }
     const id = el.dataset.id; if (q.done[id] || (q.fb && q.fb.checking)) return;
     if (q.fb) commitFb();
-    q.active = id; paintQuiz();
+    q.active = id; q.hint = null; paintQuiz();
   },
   qSubmit: () => submitAns(false),
   qSkip: () => submitAns(true),
+  qHint: () => showHint(),
+  qOpt: el => pickHint(el.dataset.id),
   qOver: () => { const q = vq; if (!q.fb) return; q.fb.kind = 'ok'; q.fb.note = ''; q.done[q.fb.id] = 'ok'; paintQuiz(); },
   qNext,
   addWord,

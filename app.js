@@ -15,38 +15,36 @@ const addDays = (s, n) => { const d = toDate(s); d.setDate(d.getDate() + n); ret
 const daysBetween = (a, b) => Math.round((toDate(b) - toDate(a)) / 864e5);
 const today = () => dstr();
 
-// ───────── Course content index ─────────
-const ITEM = {}, UNIT = {};
-UNITS.forEach(u => {
-  UNIT[u.id] = u;
-  u.items = u.items.map((r, i) => (ITEM[u.id + ':' + i] = { id: u.id + ':' + i, unit: u.id, m: u.m, da: r[0], en: r[1], ex: r[2] || '', exEn: r[3] || '' }));
-});
-const MOD = id => MODULES.find(m => m.id === id);
-const modItems = m => UNITS.filter(u => u.m === m).flatMap(u => u.items);
-
 // ───────── State ─────────
-// custom  = the user's vocabulary bank: [{id, da, en, notes, added}]
-// vs      = learning record per vocabulary word: {n, ok, bad, step, iv, due, last, hist}
-// items   = spaced-repetition record per course word
+// custom = the user's vocabulary bank: [{id, da, en, notes, added}]
+// vs     = learning record per word: {n, ok, bad, step, iv, due, last, hist}
 const DEF_INTERVALS = [2, 4, 10, 20, 40, 80, 160];
-const fresh = () => ({ app: 'dansk', v: 2, created: today(), onboarded: false, module: 1, newPerDay: 8, slow: false, voice: '', hintOff: false, items: {}, days: {}, drills: {}, custom: [], vs: {}, sessions: [], cfg: { minutes: 20, intervals: DEF_INTERVALS.slice() }, vsort: 'new', lastBackup: '' });
+const MODES = {
+  context: ['Meaning in a text', 'A Danish text with your word highlighted; you write what it means'],
+  cloze: ['Fill the gap', 'A Danish text with your word missing; you write the Danish word'],
+  da2en: ['Danish to English', 'The Danish word on its own; you write what it means'],
+  en2da: ['English to Danish', 'Your translation on its own; you write the Danish word']
+};
+const defCfg = () => ({ minutes: 20, intervals: DEF_INTERVALS.slice(), modes: { context: true, cloze: true, da2en: true, en2da: true } });
+const fresh = () => ({ app: 'dansk', v: 3, created: today(), onboarded: false, slow: false, voice: '', hintOff: false, custom: [], vs: {}, sessions: [], cfg: defCfg(), vsort: 'new', lastBackup: '' });
 function migrate(s) {
-  s.cfg = Object.assign({ minutes: 20, intervals: DEF_INTERVALS.slice() }, s.cfg);
-  // Earlier versions scheduled the user's own words together with course words.
-  s.custom.forEach(c => {
+  s.cfg = Object.assign(defCfg(), s.cfg); s.cfg.modes = Object.assign(defCfg().modes, s.cfg.modes);
+  s.custom = s.custom || []; s.vs = s.vs || {}; s.sessions = s.sessions || [];
+  // Versions 1 and 2 had a built-in course; the very first scheduled the user's words alongside it.
+  if (s.items) s.custom.forEach(c => {
     const old = s.items['c:' + c.id];
     if (old && !s.vs[c.id]) s.vs[c.id] = { n: old.reps, ok: old.reps, bad: old.lapses || 0, step: Math.min(old.reps, 2), iv: old.iv, due: old.due, last: old.first, hist: [] };
-    delete s.items['c:' + c.id];
   });
+  ['items', 'days', 'drills', 'module', 'newPerDay'].forEach(k => delete s[k]);
+  s.v = 3;
   return s;
 }
 function load() {
-  try { const r = JSON.parse(localStorage.getItem(KEY)); if (r && r.items) return migrate(Object.assign(fresh(), r)); } catch (e) { /* fall through to a fresh state */ }
+  try { const r = JSON.parse(localStorage.getItem(KEY)); if (r && r.app === 'dansk') return migrate(Object.assign(fresh(), r)); } catch (e) { /* fall through to a fresh state */ }
   return fresh();
 }
 let S = load();
 function save() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { toast('Could not save progress on this device'); } }
-const day = () => (S.days[today()] = S.days[today()] || { rev: 0, ok: 0, new: 0, drill: 0, dok: 0, sec: 0 });
 
 // ───────── Vocabulary bank ─────────
 const byId = id => S.custom.find(c => c.id === id);
@@ -62,42 +60,43 @@ const newId = () => Date.now().toString(36) + rnd(100, 999);
 // Applies one submitted answer to a word's learning record. Scheduling is rule-based only.
 // kind: 'ok' | 'part' | 'bad'. A correct answer on a word that is not yet due, or on a second
 // attempt within the same session, is logged but does not lengthen the interval.
-function record(c, kind, answer, src, noAdvance) {
+function record(c, kind, answer, src, mode, noAdvance) {
   const v = vsW(c.id), t = today(), early = v.n > 0 && v.due > t;
   v.n++; v.last = t;
-  v.hist.unshift({ d: t, k: kind, a: answer, s: src }); v.hist = v.hist.slice(0, 12);
+  v.hist.unshift({ d: t, k: kind, a: answer, s: src, m: mode }); v.hist = v.hist.slice(0, 12);
   if (kind === 'ok') {
     v.ok++;
-    if (!noAdvance && !early) { v.step++; v.iv = intervalFor(v.step); v.due = addDays(t, v.iv); }
+    if (!noAdvance && !early) {
+      v.step++; v.iv = intervalFor(v.step);
+      // A word missed twice or more in its last six answers keeps coming back at half the interval.
+      if (v.hist.slice(0, 6).filter(h => h.k !== 'ok').length >= 2) v.iv = Math.max(1, Math.round(v.iv / 2));
+      v.due = addDays(t, v.iv);
+    }
   } else {
     v.bad++; v.step = kind === 'part' ? Math.max(0, v.step - 1) : 0; v.iv = 1; v.due = addDays(t, 1);
   }
 }
 
-// ───────── Course helpers ─────────
-const learned = m => modItems(m).filter(it => S.items[it.id]).length;
-const dueIds = () => { const t = today(); return Object.keys(S.items).filter(id => ITEM[id] && S.items[id].due <= t); };
-const freshPool = () => modItems(S.module).filter(it => !S.items[it.id]);
-const newLeft = () => Math.min(Math.max(0, S.newPerDay - day().new), freshPool().length);
-function markKnown(m) {
-  const t = today();
-  modItems(m).forEach(it => { if (!S.items[it.id]) S.items[it.id] = { iv: rnd(30, 90), ef: 2.5, due: addDays(t, rnd(7, 60)), reps: 2, lapses: 0, first: t }; });
+// Exercise types rotate with each test of a word, so it is met from every direction.
+function modeFor(c) {
+  const on = Object.keys(MODES).filter(m => S.cfg.modes[m]); if (!on.length) return 'context';
+  const n = vs(c.id).n;
+  return !n && on.includes('context') ? 'context' : on[n % on.length];
 }
 
 // ───────── Speech ─────────
 let voices = [];
 const canSpeak = 'speechSynthesis' in window;
 function loadVoices() { if (canSpeak) voices = speechSynthesis.getVoices().filter(v => /^da([-_]|$)/i.test(v.lang)); }
-const hasVoice = () => { if (!voices.length) loadVoices(); return voices.length > 0; };
 const pickVoice = () => voices.find(v => v.name === S.voice) || voices.find(v => /premium|enhanced|natural/i.test(v.name)) || voices[0];
-function speak(text, slow) {
+function speak(text) {
   if (!canSpeak || !text) return;
-  hasVoice();
+  if (!voices.length) loadVoices();
   speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(String(text).replace(/…/g, '').replace(/\s[–-]\s/g, ', '));
+  const u = new SpeechSynthesisUtterance(String(text));
   u.lang = 'da-DK';
   const v = pickVoice(); if (v) u.voice = v;
-  u.rate = slow ? 0.55 : (S.slow ? 0.75 : 0.95);
+  u.rate = S.slow ? 0.75 : 0.95;
   speechSynthesis.speak(u);
 }
 if (canSpeak) {
@@ -107,13 +106,9 @@ if (canSpeak) {
 
 // ───────── Small UI pieces ─────────
 const SPK = '<svg viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/></svg>';
-const CHECK = '<svg class="bigcheck" viewBox="0 0 64 64"><circle cx="32" cy="32" r="29"/><path d="M20 33l8 8 16-17"/></svg>';
 const spk = (t, cls = '') => `<button class="spk ${cls}" data-a="say" data-t="${esc(t)}" aria-label="Play">${SPK}</button>`;
-const slowBtn = t => `<button class="slowbtn" data-a="say" data-slow="1" data-t="${esc(t)}">Slow</button>`;
-const bar = (n, d) => `<div class="prog"><i style="width:${d ? Math.round(n / d * 100) : 0}%"></i></div>`;
-const fmtIv = d => d < 30 ? d + 'd' : d < 365 ? Math.round(d / 30) + 'mo' : (d / 365).toFixed(1) + 'y';
-const stDot = id => { const st = S.items[id]; return `<span class="st ${st ? (st.iv >= 21 ? 'known' : 'learning') : ''}"></span>`; };
 const typing = () => { const a = document.activeElement; return !!a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA'); };
+const ohead = (pct, right) => `<div class="ohead"><button class="x" data-a="closeOverlay" aria-label="Close">✕</button>${pct === null ? '<span class="grow"></span>' : `<div class="prog"><i style="width:${pct}%"></i></div>`}<span class="count">${right}</span></div>`;
 
 let toastT;
 function toast(msg) { toastEl.textContent = msg; toastEl.hidden = false; clearTimeout(toastT); toastT = setTimeout(() => { toastEl.hidden = true; }, 3000); }
@@ -127,32 +122,26 @@ function confirmSheet(title, body, okLabel, okAction, danger) {
 }
 
 // ───────── Tabs ─────────
-let tab = 'today', viewMod = S.module, obStep = 0;
+let tab = 'today';
 const standalone = () => navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
 
 function render() {
   if (!S.onboarded) { tabbar.hidden = true; view.innerHTML = onboarding(); return; }
   tabbar.hidden = false;
   tabbar.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
-  view.innerHTML = ({ today: vToday, vocab: vVocab, course: vCourse, progress: vProgress, settings: vSettings })[tab]();
+  view.innerHTML = ({ today: vToday, vocab: vVocab, progress: vProgress, settings: vSettings })[tab]();
 }
 
 function onboarding() {
-  if (obStep === 0) return `<div class="ob">
-    <h1>Dansk</h1>
-    <p class="lead">Build your Danish vocabulary by meeting your own words again and again in real Danish texts.</p>
-    <div class="list">
-      <div class="li static"><span class="grow"><b>Your words</b><small>You choose every word and write its translation</small></span></div>
-      <div class="li static"><span class="grow"><b>In context</b><small>Each review is a short Danish text with your words in it</small></span></div>
-      <div class="li static"><span class="grow"><b>Spaced out</b><small>Words you miss come back sooner, words you know come back later</small></span></div>
-    </div>
-    <button class="btn primary block" data-a="obNext">Get started</button>
-  </div>`;
   return `<div class="ob">
-    <h1>Course level</h1>
-    <p class="lead">The app also has an optional course that follows Danskuddannelse 3. Pick the module you are studying. Earlier modules are marked as known.</p>
-    <div class="list">${MODULES.map(m => `
-      <button class="li" data-a="obPick" data-m="${m.id}"><span class="dot">${m.level}</span><span class="grow"><b>${m.name} · ${m.tag}</b><small>${m.desc}</small></span><span class="chev">›</span></button>`).join('')}</div>
+    <h1>Dansk</h1>
+    <p class="lead">Learn the Danish words you choose, by meeting them again and again in real Danish texts.</p>
+    <div class="list">
+      <div class="li static"><span class="grow"><b>Your words only</b><small>You add every word and write its translation</small></span></div>
+      <div class="li static"><span class="grow"><b>Real texts</b><small>News from DR with your words highlighted or left out for you to fill in</small></span></div>
+      <div class="li static"><span class="grow"><b>It adapts</b><small>Words you miss come back sooner and more often, words you know fade out</small></span></div>
+    </div>
+    <button class="btn primary block" data-a="obDone">Get started</button>
   </div>`;
 }
 
@@ -162,8 +151,7 @@ function vToday() {
   const news = S.custom.filter(c => !vs(c.id).n).length, due = S.custom.filter(c => vs(c.id).n && isDueV(c)).length;
   const { pick } = vocabQueue(false), mins = Math.max(1, Math.round(pick.length * 40 / 60));
   const upcoming = S.custom.map(c => vs(c.id)).filter(v => v.n && v.due > today()).map(v => v.due).sort()[0];
-  const cDue = dueIds().length, cNew = newLeft();
-  const stale = S.custom.length + Object.keys(S.items).length >= 10 && (!S.lastBackup || S.lastBackup < addDays(today(), -14));
+  const stale = S.custom.length >= 10 && (!S.lastBackup || S.lastBackup < addDays(today(), -14));
   let card;
   if (!S.custom.length) card = `<h2>Start your vocabulary</h2><p class="muted">Add the Danish words you want to learn, with your own translations. Sessions are built from them.</p><button class="btn primary block" data-a="tab" data-tab="vocab">Add words</button>`;
   else if (pick.length) card = `<h2>Today's session</h2><p class="muted">${due} to review · ${news} new · about ${mins} min</p><button class="btn primary block" data-a="vStart">Start session</button>`;
@@ -175,14 +163,14 @@ function vToday() {
   ${stale ? `<section class="note"><b>Time for a backup</b><p>${S.lastBackup ? 'Your last backup is more than two weeks old.' : 'You have not saved a backup yet.'}</p><button class="link" data-a="export">Save backup file</button></section>` : ''}
   <div class="list">
     <button class="li" data-a="tab" data-tab="vocab"><span class="grow"><b>Vocabulary</b><small>${S.custom.length} ${S.custom.length === 1 ? 'word' : 'words'} in your bank</small></span><span class="chev">›</span></button>
-    <button class="li" data-a="${cDue + cNew ? 'start' : 'tab'}" data-tab="course"><span class="grow"><b>Course session</b><small>${cDue + cNew ? `${cDue} to review · ${cNew} new` : 'Nothing due in the course'}</small></span><span class="chev">›</span></button>
+    <button class="li" data-a="tab" data-tab="progress"><span class="grow"><b>Progress</b><small>${S.custom.filter(c => statusOf(c) === 'mastered').length} mastered · ${S.custom.filter(overdueV).length} overdue</small></span><span class="chev">›</span></button>
   </div>`;
 }
 
 const SORTS = { new: 'Newest first', az: 'A to Z', due: 'Next review', hard: 'Most missed' };
 function sortedVocab() {
   const a = S.custom.slice(), k = S.vsort;
-  if (k === 'az') a.sort((x, y) => x.da.replace(/^(en|et|at)\s+/i, '').localeCompare(y.da.replace(/^(en|et|at)\s+/i, ''), 'da'));
+  if (k === 'az') a.sort((x, y) => termOf(x.da).localeCompare(termOf(y.da), 'da'));
   else if (k === 'due') a.sort((x, y) => (vs(x.id).due || '0') < (vs(y.id).due || '0') ? -1 : 1);
   else if (k === 'hard') a.sort((x, y) => vs(y.id).bad - vs(x.id).bad);
   else a.reverse();
@@ -191,13 +179,14 @@ function sortedVocab() {
 const vocabRow = c => { const v = vs(c.id), st = statusOf(c); return `
   <button class="li" data-a="word" data-id="${c.id}" data-s="${esc((c.da + ' ' + c.en).toLowerCase())}"><span class="grow"><b>${esc(c.da)}</b><small>${esc(c.en)}</small></span><span class="meta"><span class="pill ${st}">${st}</span><small>${!v.n ? '' : v.due <= today() ? 'due' : v.due.slice(5)}</small></span></button>`; };
 
+// Word fields keep the iPhone keyboard's suggestions on; only automatic capitals are off.
 function vVocab() {
   return `
   <header class="top"><div><h1>Vocabulary</h1></div></header>
   <section class="card form">
-    <input id="wDa" type="text" placeholder="Danish word or expression" autocapitalize="none" autocomplete="off" autocorrect="off" spellcheck="false" lang="da" enterkeyhint="next">
-    <input id="wEn" type="text" placeholder="English translation" autocapitalize="none" autocomplete="off" enterkeyhint="next">
-    <input id="wNo" type="text" placeholder="Notes (optional)" autocomplete="off" enterkeyhint="done">
+    <input id="wDa" type="text" placeholder="Danish word or expression" autocapitalize="none" lang="da" enterkeyhint="next">
+    <input id="wEn" type="text" placeholder="English translation" autocapitalize="none" lang="en" enterkeyhint="next">
+    <input id="wNo" type="text" placeholder="Notes (optional)" enterkeyhint="done">
     <button class="btn primary block" data-a="addWord">Add word</button>
     <button class="btn ghost block" data-a="bulk">Paste a list</button>
     <small class="center">Separate alternative translations with a semicolon.</small>
@@ -213,9 +202,9 @@ function wordSheet(id) {
   const v = vs(id), st = statusOf(c), pos = posOf(c), K = { ok: 'Correct', part: 'Partly right', bad: 'Incorrect' };
   openSheet(`<div class="row">${spk(c.da)}<div class="grow"><h2>${esc(c.da)}</h2><p class="muted tight">${pos ? pos + ' · ' : ''}added ${c.added}</p></div><span class="pill ${st}">${st}</span></div>
     <div class="card form flat">
-      <input id="eDa" type="text" value="${esc(c.da)}" autocapitalize="none" autocomplete="off" autocorrect="off" spellcheck="false" lang="da">
-      <input id="eEn" type="text" value="${esc(c.en)}" placeholder="English translation" autocapitalize="none" autocomplete="off">
-      <input id="eNo" type="text" value="${esc(c.notes || '')}" placeholder="Notes (optional)" autocomplete="off">
+      <input id="eDa" type="text" value="${esc(c.da)}" autocapitalize="none" lang="da">
+      <input id="eEn" type="text" value="${esc(c.en)}" placeholder="English translation" autocapitalize="none" lang="en">
+      <input id="eNo" type="text" value="${esc(c.notes || '')}" placeholder="Notes (optional)">
       <button class="btn tint block" data-a="saveWord" data-id="${id}">Save changes</button>
     </div>
     <div class="list">
@@ -225,7 +214,7 @@ function wordSheet(id) {
       <div class="li static slim"><span class="grow">Next review</span><span>${!v.n ? 'next session' : v.due <= today() ? 'due now' : v.due}</span></div>
     </div>
     ${v.hist.length ? `<h3>Recent answers</h3><div class="list">${v.hist.map(h => `
-      <div class="li static slim"><span class="grow"><b class="k-${h.k}">${K[h.k]}</b><small>${h.a ? '“' + esc(h.a) + '”' : 'no answer'} · ${esc(h.s || '')}</small></span><small>${h.d}</small></div>`).join('')}</div>` : ''}
+      <div class="li static slim"><span class="grow"><b class="k-${h.k}">${K[h.k]}</b><small>${h.a ? '“' + esc(h.a) + '”' : 'no answer'}${h.m && MODES[h.m] ? ' · ' + MODES[h.m][0] : ''}${h.s ? ' · ' + esc(h.s) : ''}</small></span><small>${h.d}</small></div>`).join('')}</div>` : ''}
     <button class="btn ghost block" data-a="read" data-id="${id}">Read this word in a text</button>
     <button class="btn ghost block red" data-a="askDelWord" data-id="${id}">Delete word</button>`);
 }
@@ -240,49 +229,20 @@ function parseBulk(text) {
   const seen = new Set(S.custom.map(c => c.da.toLowerCase()));
   return pairs.map(([da, en]) => { const dup = seen.has(da.toLowerCase()); seen.add(da.toLowerCase()); return { da, en, dup }; });
 }
-let bulkParsed = [];
+let bulkParsed = [], bulkText = '';
 function bulkSheet(text) {
   openSheet(`<h2>Paste a list</h2><p class="muted">One word per line with its translation after a tab, dash or equals sign. A table copied as alternating Danish and English lines also works.</p>
-    <textarea id="bulkT" rows="9" placeholder="at beslutte - to decide&#10;en mulighed - an opportunity; a possibility" autocapitalize="none" autocorrect="off" spellcheck="false">${esc(text || '')}</textarea>
+    <textarea id="bulkT" rows="9" placeholder="at beslutte - to decide&#10;en mulighed - an opportunity; a possibility" autocapitalize="none">${esc(text || '')}</textarea>
     <button class="btn primary block" data-a="bulkReview">Review</button>`);
 }
 function bulkReview() {
-  const text = $('#bulkT').value; bulkParsed = parseBulk(text);
+  bulkText = $('#bulkT').value; bulkParsed = parseBulk(bulkText);
   const ok = bulkParsed.filter(p => !p.dup);
   if (!bulkParsed.length) { toast('No word pairs found in that text'); return; }
   openSheet(`<h2>Review ${ok.length} ${ok.length === 1 ? 'word' : 'words'}</h2>
     <div class="list">${bulkParsed.map(p => `<div class="li static slim ${p.dup ? 'dim' : ''}"><span class="grow"><b>${esc(p.da)}</b><small>${esc(p.en)}${p.dup ? ' · already in your list, skipped' : ''}</small></span></div>`).join('')}</div>
     <button class="btn primary block" data-a="bulkSave" ${ok.length ? '' : 'disabled'}>Save ${ok.length} ${ok.length === 1 ? 'word' : 'words'}</button>
     <button class="btn ghost block" data-a="bulkBack">Back to edit</button>`);
-  bulkSheet.text = text;
-}
-
-const DRILLS = {
-  pairs: { name: 'Sound pairs', desc: 'Hear a word and pick which one it was' },
-  numbers: { name: 'Numbers', desc: 'Hear a number and type the digits' },
-  gender: { name: 'En or et?', desc: 'Pick the right article for each noun' },
-  build: { name: 'Word order', desc: 'Put the sentence together' }
-};
-
-function vCourse() {
-  const m = MOD(viewMod), units = UNITS.filter(u => u.m === viewMod), tot = modItems(viewMod).length, l = learned(viewMod);
-  const cDue = dueIds().length, cNew = newLeft();
-  return `
-  <header class="top"><div><h1>Course</h1><p class="sub">Optional ready-made words and drills, following Danskuddannelse 3.</p></div></header>
-  <section class="card"><h2>Course session</h2><p class="muted">${cDue} to review · ${cNew} new from ${MOD(S.module).name}</p>
-    ${cDue + cNew ? `<button class="btn tint block" data-a="start">Start course session</button>` : freshPool().length ? `<button class="btn tint block" data-a="more">Learn 5 more words</button>` : ''}</section>
-  <div class="seg">${MODULES.map(x => `<button class="${x.id === viewMod ? 'on' : ''}" data-a="viewMod" data-m="${x.id}">${x.id}</button>`).join('')}</div>
-  <section class="card">
-    <p class="eyebrow">${m.tag} · about ${m.level}${viewMod === S.module ? ' · current' : ''}</p><h2>${m.name}</h2><p class="muted">${m.desc}</p>
-    ${bar(l, tot)}<small class="under">${l} of ${tot} words learned</small>
-    ${viewMod === S.module ? '' : `<button class="btn tint block" data-a="setMod">Study this module</button>`}
-    ${l < tot ? `<button class="btn ghost block" data-a="askKnown">I already know this module</button>` : ''}
-  </section>
-  <div class="list">${units.map((u, i) => { const n = u.items.filter(x => S.items[x.id]).length; return `
-    <button class="li" data-a="unit" data-u="${u.id}"><span class="idx">${i + 1}</span><span class="grow"><b>${u.title}</b><small>${n} of ${u.items.length}</small></span>${n === u.items.length ? '<span class="tick">✓</span>' : ''}<span class="chev">›</span></button>`; }).join('')}</div>
-  <h3>Drills</h3>
-  <div class="list">${Object.keys(DRILLS).map(k => { const d = DRILLS[k], s = S.drills[k]; return `
-    <button class="li" data-a="drill" data-k="${k}"><span class="grow"><b>${d.name}</b><small>${d.desc}</small></span><small>${s && s.n ? Math.round(s.ok / s.n * 100) + '%' : ''}</small><span class="chev">›</span></button>`; }).join('')}</div>`;
 }
 
 function vProgress() {
@@ -305,10 +265,7 @@ function vProgress() {
   <h3>Recent sessions</h3>
   ${S.sessions.length ? `<div class="list">${S.sessions.slice(0, 8).map(s => `<div class="li static slim"><span class="grow">${s.d}</span><span>${s.ok} of ${s.n} correct · ${s.n ? Math.round(s.ok / s.n * 100) : 0}%</span></div>`).join('')}</div>` : `<p class="empty">No sessions yet.</p>`}
   ${hard.length ? `<h3>Words that keep causing trouble</h3><div class="list">${hard.map(x => `<button class="li" data-a="word" data-id="${x.id}"><span class="grow"><b>${esc(x.da)}</b><small>${esc(x.en)}</small></span><small>missed ${vs(x.id).bad} of ${vs(x.id).n}</small><span class="chev">›</span></button>`).join('')}</div>` : ''}
-  <div class="list"><button class="li" data-a="tab" data-tab="vocab"><span class="grow"><b>All words</b><small>Search the list and open any word for its history</small></span><span class="chev">›</span></button></div>
-  <h3>Course</h3>
-  <div class="list">${MODULES.map(m => { const t = modItems(m.id).length, l = learned(m.id); return `
-    <div class="li static"><span class="dot">${m.level}</span><span class="grow"><b>${m.name} · ${m.tag}</b>${bar(l, t)}</span><small>${l}/${t}</small></div>`; }).join('')}</div>`;
+  <div class="list"><button class="li" data-a="tab" data-tab="vocab"><span class="grow"><b>All words</b><small>Search the list and open any word for its history</small></span><span class="chev">›</span></button></div>`;
 }
 
 let persisted = null;
@@ -316,15 +273,19 @@ const hasAI = () => { try { return !!localStorage.getItem(AI_KEY); } catch (e) {
 function vSettings() {
   return `
   <header class="top"><div><h1>Settings</h1></div></header>
-  <h3>Vocabulary sessions</h3>
+  <h3>Exercises</h3>
+  <div class="list">${Object.keys(MODES).map(m => `
+    <div class="li static"><span class="grow"><b>${MODES[m][0]}</b><small>${MODES[m][1]}</small></span><button class="switch ${S.cfg.modes[m] ? 'on' : ''}" data-a="mode" data-m="${m}" aria-label="${MODES[m][0]}"><i></i></button></div>`).join('')}</div>
+  <p class="foot-note">Each word moves through the exercises you leave on, one per review. A new word always starts with its meaning in a text.</p>
+  <h3>Sessions</h3>
   <div class="list">
     <div class="li static"><span class="grow"><b>Session length</b><small>About ${Math.round(S.cfg.minutes * 60 / 40)} words per session</small></span><div class="stepper"><button data-a="mins" data-d="-5">−</button><span>${S.cfg.minutes}</span><button data-a="mins" data-d="5">+</button></div></div>
     <div class="li static"><span class="grow"><b>Review intervals</b><small>Days after each correct answer in a row</small></span><input type="text" class="short" data-c="intervals" value="${S.cfg.intervals.join(', ')}" inputmode="numeric"></div>
   </div>
-  <p class="foot-note">A missed word comes back the next day and starts the intervals again. Each text is at most five sentences.</p>
+  <p class="foot-note">A missed word comes back the next day and starts the intervals again. A word you keep missing returns at half the usual interval until you get it right consistently.</p>
   <h3>AI assistance (optional)</h3>
   <div class="list">
-    <div class="li static"><span class="grow"><b>${hasAI() ? 'Key saved on this phone' : 'No key'}</b><small>${hasAI() ? 'Used to judge your answers and to write a text when none is found' : 'Without a key, answers are matched against your translations'}</small></span>${hasAI() ? `<button class="link" data-a="aiTest">Test</button>` : ''}</div>
+    <div class="li static"><span class="grow"><b>${hasAI() ? 'Key saved on this phone' : 'No key'}</b><small>${hasAI() ? 'Used to judge your English answers and to write a text when none is found' : 'Without a key, answers are matched against your translations'}</small></span>${hasAI() ? `<button class="link" data-a="aiTest">Test</button>` : ''}</div>
     <div class="li static"><input type="password" id="aiKey" placeholder="Anthropic API key" autocomplete="off"><button class="link" data-a="aiSave">Save</button></div>
     ${hasAI() ? `<button class="li" data-a="aiRemove"><span class="grow"><b class="red">Remove key</b></span></button>` : ''}
   </div>
@@ -334,10 +295,6 @@ function vSettings() {
     <div class="li static"><span class="grow"><b>Slower speech</b></span><button class="switch ${S.slow ? 'on' : ''}" data-a="slow" aria-label="Slower speech"><i></i></button></div>
     <div class="li static"><span class="grow"><b>Voice</b></span>${voices.length ? `<select data-c="voice">${voices.map(v => `<option ${v.name === (pickVoice() || {}).name ? 'selected' : ''}>${esc(v.name)}</option>`).join('')}</select>` : '<small>No Danish voice</small>'}</div>
   </div>
-  <h3>Course</h3>
-  <div class="list">
-    <div class="li static"><span class="grow"><b>New course words per day</b></span><div class="stepper"><button data-a="npd" data-d="-2">−</button><span>${S.newPerDay}</span><button data-a="npd" data-d="2">+</button></div></div>
-  </div>
   <h3>Your data</h3>
   <div class="list">
     <button class="li" data-a="export"><span class="grow"><b>Save backup file</b><small>${S.lastBackup ? 'Last saved ' + S.lastBackup : 'Never saved'} · everything, as JSON</small></span><span class="chev">›</span></button>
@@ -346,15 +303,6 @@ function vSettings() {
   </div>
   <p class="foot-note">Everything is stored on this phone only${persisted === true ? ', in protected storage' : ''}. Deleting the Home Screen icon deletes it, so keep a backup file in Files or iCloud Drive.</p>
   <div class="list"><button class="li" data-a="askReset"><span class="grow"><b class="red">Erase everything</b></span></button></div>`;
-}
-
-function unitSheet(id) {
-  const u = UNIT[id], n = u.items.filter(i => S.items[i.id]).length;
-  openSheet(`<h2>${esc(u.title)}</h2>
-    <div class="tip"><b>Tip</b>${esc(u.tip)}</div>
-    <div class="list">${u.items.map(it => `
-      <div class="li static slim">${spk(it.da, 'sm')}<span class="grow"><b>${esc(it.da)}</b><small>${esc(it.en)}</small></span>${stDot(it.id)}</div>`).join('')}</div>
-    <button class="btn primary block" data-a="studyUnit" data-u="${id}">${n < u.items.length ? 'Study this unit' : 'Review this unit'}</button>`);
 }
 
 // ═════════ Finding Danish texts ═════════
@@ -430,6 +378,7 @@ async function loadNews() {
   if (NEWS) return NEWS;
   try { NEWS = (await getJSON('news.json')).items || []; return NEWS; } catch (e) { return []; }
 }
+
 async function buildPassage(ids, eligible, used) {
   const words = ids.map(byId).filter(Boolean), primary = words[0];
   const cands = S.custom.filter(c => eligible(c.id)), wanted = new Set(ids);
@@ -483,13 +432,20 @@ async function buildPassage(ids, eligible, used) {
   return best;
 }
 
-const srcLine = p => p.src === 'none' ? 'No text found for this word, so it is shown on its own'
-  : p.src === 'AI-generated' ? 'AI-generated text · not a real source'
+const srcLine = p => p.src === 'AI-generated' ? 'AI-generated text · not a real source'
   : `${esc(p.src)} · <a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.title)}</a>`;
-function markup(p, cls) {
+// Renders a passage. `cls` gives each target its state; `gap` says whether a target is still a
+// blank to fill, in which case every other occurrence of that word is blanked as well.
+const GAP = '      ';
+function markup(p, cls, gap) {
+  const gaps = p.targets.filter(t => gap && gap(t.id)).map(t => byId(t.id)).filter(Boolean);
+  const plain = s => { gaps.forEach(c => { s = s.replace(new RegExp(rx(c).source, 'giu'), (m, pre) => pre + '\u0001'); }); return esc(s).replace(/\u0001/g, `<span class="gapped">${GAP}</span>`); };
   let html = '', pos = 0;
-  p.targets.forEach(t => { html += esc(p.text.slice(pos, t.start)) + `<mark class="${cls(t.id)}" data-a="qPick" data-id="${t.id}">${esc(p.text.slice(t.start, t.end))}</mark>`; pos = t.end; });
-  return html + esc(p.text.slice(pos));
+  p.targets.forEach(t => {
+    html += plain(p.text.slice(pos, t.start)) + `<mark class="${cls(t.id)}${gap && gap(t.id) ? ' gap' : ''}" data-a="qPick" data-id="${t.id}">${gap && gap(t.id) ? GAP : esc(p.text.slice(t.start, t.end))}</mark>`;
+    pos = t.end;
+  });
+  return html + plain(p.text.slice(pos));
 }
 
 // ═════════ AI assistance (optional, with the user's own key) ═════════
@@ -519,8 +475,8 @@ const obj = (props, req) => ({ type: 'object', properties: props, required: req,
 
 async function aiGrade(c, form, passage, answer) {
   return aiJSON(
-    'You grade an English translation given by an adult learner of Danish. Judge only whether the answer conveys the meaning the Danish word has in the passage. Accept synonyms, either tense or number, and small spelling mistakes. "partial" means the answer is related but misses or narrows the meaning. Reply with a verdict and one short sentence of explanation, in English.',
-    `Danish word as the learner saved it: ${c.da}\nForm in the passage: ${form}\nThe learner's own translation: ${c.en}${c.notes ? '\nLearner notes: ' + c.notes : ''}\nPassage: ${passage}\n\nLearner's answer: ${answer}`,
+    'You grade an English translation given by an adult learner of Danish. Judge only whether the answer conveys the meaning of the Danish word' + (passage ? ' as it is used in the passage' : '') + '. Accept synonyms, either tense or number, and small spelling mistakes. "partial" means the answer is related but misses or narrows the meaning. Reply with a verdict and one short sentence of explanation, in English.',
+    `Danish word as the learner saved it: ${c.da}${form ? '\nForm in the passage: ' + form : ''}\nThe learner's own translation: ${c.en}${c.notes ? '\nLearner notes: ' + c.notes : ''}${passage ? '\nPassage: ' + passage : ''}\n\nLearner's answer: ${answer}`,
     obj({ verdict: { type: 'string', enum: ['correct', 'partial', 'incorrect'] }, note: { type: 'string' } }, ['verdict', 'note']));
 }
 async function aiPassage(words) {
@@ -541,13 +497,27 @@ function lev(a, b) {
   for (let i = 1; i <= a.length; i++) { const cur = [i]; for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); prev = cur; }
   return prev[b.length];
 }
-function localMatch(answer, en) {
+// English answer against the user's translations: alternatives, small typos, other endings.
+function enMatch(answer, en) {
   const a = strip(answer); if (!a) return false;
   return en.split(/[;,\/]|\bor\b/).map(strip).filter(Boolean).some(alt =>
     a === alt || stemAll(a) === stemAll(alt) || lev(a, alt) <= (alt.length >= 9 ? 2 : alt.length >= 5 ? 1 : 0));
 }
+// Danish answer: the saved word, the form in the text, or another inflection of it. Spelling
+// counts here, so a one-letter slip or a wrong article is only "partly right".
+function daMatch(answer, c, form) {
+  const a = answer.trim().toLowerCase().replace(/\s+/g, ' '), term = termOf(c.da), full = c.da.trim().toLowerCase();
+  const good = [term, full]; if (form) good.push(form.toLowerCase());
+  if (!a) return { kind: 'bad' };
+  if (good.includes(a)) return { kind: 'ok' };
+  const m = rx(c).exec(a); if (m && m[2].length === a.length) return { kind: 'ok' };
+  const art = a.match(/^(en|et|at)\s+(.+)$/);
+  if (art && art[2] === term) return { kind: 'part', note: `Right word, but it is “${c.da}”.` };
+  if (good.some(g => g.length >= 5 && lev(a, g) === 1)) return { kind: 'part', note: 'Nearly: check the spelling.' };
+  return { kind: 'bad' };
+}
 
-// ═════════ Vocabulary session ═════════
+// ═════════ The session ═════════
 // Chooses what to test today: new words, then due words by urgency, aiming for about 70% from
 // the last seven days and 30% older, and filling from either side when one runs short.
 function vocabQueue(ahead) {
@@ -561,31 +531,54 @@ function vocabQueue(ahead) {
   return { pick, left: pool.length - pick.length };
 }
 
+// vq.pending = words waiting for a text (meaning / gap); vq.quick = words waiting for a quick
+// translation card. Texts and short runs of quick cards alternate.
 let vq = null;
+const inText = m => m === 'context' || m === 'cloze';
 function startVocab(ahead) {
   const { pick } = vocabQueue(ahead);
   if (!pick.length) { toast('Nothing to review right now'); return; }
-  sess = null; drill = null; reader = null;
-  const ids = pick.map(c => c.id);
-  vq = { ids, pending: ids.slice(), retry: [], retried: new Set(), first: {}, phase2: false, intro: pick.filter(c => !vs(c.id).n), p: null, active: null, fb: null, done: {}, used: new Set(), next: null, loading: false, start: Date.now(), tick: 0, finished: false };
+  reader = null;
+  const ids = pick.map(c => c.id), mode = {}; pick.forEach(c => { mode[c.id] = modeFor(c); });
+  vq = { ids, mode, pending: ids.filter(id => inText(mode[id])), quick: shuffle(ids.filter(id => !inText(mode[id]))), qrun: 0, retry: [], retried: new Set(), first: {}, phase2: false,
+    intro: pick.filter(c => !vs(c.id).n), p: null, card: null, active: null, fb: null, done: {}, used: new Set(), next: null, loading: false, start: Date.now(), tick: 0, finished: false };
   closeSheet();
-  if (vq.intro.length) paintIntro(); else nextPassage();
+  if (vq.intro.length) paintIntro(); else advance();
 }
 
 function paintIntro() {
-  overlay.innerHTML = ohead(null, `${vq.intro.length} new`) + `<div class="stage top"><h2>New words</h2><p class="muted">Read them through once. They count as learned only after you recall them in a text.</p>
+  overlay.innerHTML = ohead(null, `${vq.intro.length} new`) + `<div class="stage top"><h2>New words</h2><p class="muted">Read them through once. They count as learned only after you recall them.</p>
     <div class="list">${vq.intro.map(c => `<div class="li static slim">${spk(c.da, 'sm')}<span class="grow"><b>${esc(c.da)}</b><small>${esc(c.en)}${posOf(c) ? ' · ' + posOf(c) : ''}${c.notes ? ' · ' + esc(c.notes) : ''}</small></span></div>`).join('')}</div></div>
     <div class="foot"><button class="btn primary block" data-a="vBegin">Start</button></div>`;
   overlay.hidden = false;
 }
 
-// A word can be highlighted in a passage if it has not been answered yet in this session.
-const eligibleNow = q => id => q.phase2 ? q.pending.includes(id) : !(id in q.first);
+function advance() {
+  const q = vq;
+  if (q.qrun > 0 && q.quick.length) { q.qrun--; return showQuick(q.quick[0]); }
+  if (q.pending.length) { q.qrun = 3; return nextPassage(); }
+  if (q.quick.length) return showQuick(q.quick[0]);
+  if (q.retry.length) {
+    // Second chance for missed words, always as "meaning in a text" so they are seen in use.
+    q.retry.forEach(id => { q.mode[id] = 'context'; });
+    q.pending = q.retry; q.retry = []; q.phase2 = true; q.next = null; q.qrun = 0;
+    return nextPassage();
+  }
+  finishVocab();
+}
+
+function showQuick(id, mode) {
+  const q = vq; q.tick++;
+  q.p = null; q.fb = null; q.loading = false; q.card = { id, mode: mode || q.mode[id] }; q.active = id;
+  paintQuiz();
+}
+
+// A word can be highlighted in a text if it has not been answered yet in this session and is
+// not waiting for a quick card.
+const eligibleNow = q => id => q.phase2 ? q.pending.includes(id) : !(id in q.first) && !q.quick.includes(id);
 async function nextPassage() {
   const q = vq, k = ++q.tick;
-  if (!q.pending.length && q.retry.length) { q.pending = q.retry; q.retry = []; q.phase2 = true; q.next = null; }
-  if (!q.pending.length) return finishVocab();
-  q.loading = true; q.p = null; q.fb = null; q.active = null; paintQuiz();
+  q.loading = true; q.p = null; q.card = null; q.fb = null; q.active = null; paintQuiz();
   let p = null;
   if (q.next) {
     const n = q.next; q.next = null;
@@ -595,6 +588,10 @@ async function nextPassage() {
   }
   if (!p) p = await buildPassage(q.pending, eligibleNow(q), q.used);
   if (vq !== q || q.tick !== k) return;
+  // No text anywhere for this word: ask it as a plain translation card instead.
+  if (p.src === 'none') return showQuick(p.primary, q.mode[p.primary] === 'cloze' ? 'en2da' : 'da2en');
+  const gaps = q.phase2 ? [] : p.targets.filter(t => q.mode[t.id] === 'cloze');
+  p.gap = gaps.length ? (gaps.find(t => t.id === p.primary) || gaps[0]).id : null;
   q.p = p; q.used.add(p.text); q.done = {}; q.loading = false; q.active = p.targets[0].id;
   paintQuiz();
   // Fetch the following text while this one is being answered.
@@ -602,47 +599,62 @@ async function nextPassage() {
   if (rest.length) { const ok = id => eligibleNow(q)(id) && !shown.has(id); q.next = buildPassage(rest, ok, q.used); q.next.catch(() => {}); }
 }
 
+// Only one word per text is blanked out, so the text stays readable; any other word in it,
+// including ones that are not part of today's selection, is asked for its meaning.
+const modeOf = (q, id) => q.card ? q.card.mode : (!q.phase2 && q.p && q.p.gap === id ? 'cloze' : 'context');
+const wantsDanish = m => m === 'cloze' || m === 'en2da';
+
 function paintQuiz() {
   const q = vq, p = q.p, doneN = Object.keys(q.first).length, total = q.ids.length;
   let body;
-  if (q.loading || !p) body = `<div class="stage"><div class="spinner"></div><p class="muted">Finding a Danish text</p></div>`;
+  if (q.loading) body = `<div class="stage"><div class="spinner"></div><p class="muted">Finding a Danish text</p></div>`;
   else {
-    const c = byId(q.active), t = p.targets.find(x => x.id === q.active), fb = q.fb;
-    const left = p.targets.filter(x => !q.done[x.id]).length;
+    const c = byId(q.active), mode = modeOf(q, q.active), fb = q.fb, da = wantsDanish(mode);
+    const t = p && p.targets.find(x => x.id === q.active), left = p ? p.targets.filter(x => !q.done[x.id]).length : 0;
     let panel;
     if (fb && fb.checking) panel = `<div class="ans"><p class="muted">Checking your answer</p></div>`;
     else if (fb) {
       const label = { ok: 'Correct', part: 'Partly right', bad: 'Not quite' }[fb.kind];
       panel = `<div class="ans"><p class="verdict k-${fb.kind}">${label}</p>
-        <p><b>${esc(c.da)}</b> — ${esc(c.en)}</p>
+        <div class="row">${spk(c.da, 'sm')}<p class="grow"><b>${esc(c.da)}</b> — ${esc(c.en)}</p></div>
         ${fb.ans ? `<p class="muted small">You wrote “${esc(fb.ans)}”.${fb.note ? ' ' + esc(fb.note) : ''}</p>` : ''}
         ${c.notes ? `<p class="muted small">${esc(c.notes)}</p>` : ''}
         <button class="btn primary block" data-a="qNext">${left ? 'Next word' : 'Continue'}</button>
         ${fb.kind !== 'ok' && fb.ans ? `<button class="btn ghost block" data-a="qOver">My answer was right</button>` : ''}</div>`;
-    } else panel = `<div class="ans"><label for="ans">What does <b>${esc(t.form)}</b> mean here?</label>
-        <input id="ans" type="text" placeholder="English meaning" autocapitalize="none" autocomplete="off" enterkeyhint="send">
+    } else {
+      const ask = mode === 'context' ? `What does <b>${esc(t.form)}</b> mean here?`
+        : mode === 'cloze' ? `Which Danish word is missing? It means <b>${esc(c.en)}</b>.`
+        : mode === 'da2en' ? 'What does it mean?' : 'Write it in Danish.';
+      // Danish answers are typed without keyboard help, since suggestions would give the spelling away.
+      panel = `<div class="ans"><label for="ans">${ask}</label>
+        <input id="ans" type="text" placeholder="${da ? 'Danish word' : 'English meaning'}" autocapitalize="none" autocomplete="off" lang="${da ? 'da' : 'en'}" ${da ? 'autocorrect="off" spellcheck="false"' : ''} enterkeyhint="send">
         <button class="btn primary block" data-a="qSubmit">Submit</button>
         <button class="btn ghost block" data-a="qSkip">I don't know</button></div>`;
-    body = `<div class="stage top read"><p class="source">${srcLine(p)}${p.targets.length > 1 ? ` · ${p.targets.length} words to answer` : ''}</p>
-      <div class="reading ${p.src === 'none' ? 'solo' : ''}" lang="da">${markup(p, id => q.done[id] ? 'm-' + q.done[id] : id === q.active ? 'm-active' : 'm-todo')}</div>${panel}</div>`;
+    }
+    if (p) body = `<div class="stage top read"><p class="source">${srcLine(p)}${p.targets.length > 1 ? ` · ${p.targets.length} words to answer` : ''}</p>
+      <div class="reading" lang="da">${markup(p, id => q.done[id] ? 'm-' + q.done[id] : id === q.active ? 'm-active' : 'm-todo', id => modeOf(q, id) === 'cloze' && !q.done[id])}</div>${panel}</div>`;
+    else body = `<div class="stage top read"><p class="source">${MODES[mode][0]}</p>
+      <div class="reading solo" lang="${da ? 'en' : 'da'}">${da ? esc(c.en) : esc(c.da)}${!da && !fb ? `<div class="solo-spk">${spk(c.da, 'sm')}</div>` : ''}</div>${panel}</div>`;
   }
   overlay.innerHTML = ohead(Math.round(doneN / total * 100), q.phase2 ? 'second try' : `${doneN} of ${total}`) + body;
   overlay.hidden = false;
-  const inp = $('#ans'); if (inp) inp.focus({ preventScroll: false });
+  const inp = $('#ans'); if (inp) inp.focus();
 }
 
 async function submitAns(giveUp) {
-  const q = vq, id = q.active, c = byId(id); if (!c || q.fb) return;
+  const q = vq, id = q.active, c = byId(id); if (!c || q.fb || q.loading) return;
   const inp = $('#ans'), ans = giveUp ? '' : inp.value.trim();
   if (!giveUp && !ans) { inp.focus(); return; }
-  const t = q.p.targets.find(x => x.id === id);
-  let kind = ans && localMatch(ans, c.en) ? 'ok' : 'bad', note = '';
-  if (kind === 'bad' && ans && hasAI()) {
+  const mode = modeOf(q, id), t = q.p && q.p.targets.find(x => x.id === id);
+  let kind = 'bad', note = '';
+  if (wantsDanish(mode)) { const r = daMatch(ans, c, mode === 'cloze' && t ? t.form : ''); kind = r.kind; note = r.note || ''; }
+  else if (ans && enMatch(ans, c.en)) kind = 'ok';
+  else if (ans && hasAI()) {
     q.fb = { id, ans, checking: true }; paintQuiz();
-    try { const r = await aiGrade(c, t.form, q.p.text, ans); if (r) { kind = r.verdict === 'correct' ? 'ok' : r.verdict === 'partial' ? 'part' : 'bad'; note = r.note || ''; } } catch (e) { aiFail(e); }
+    try { const r = await aiGrade(c, t ? t.form : '', q.p ? q.p.text : '', ans); if (r) { kind = r.verdict === 'correct' ? 'ok' : r.verdict === 'partial' ? 'part' : 'bad'; note = r.note || ''; } } catch (e) { aiFail(e); }
     if (vq !== q || q.active !== id) return;
   }
-  q.fb = { id, ans, kind, note }; q.done[id] = kind; paintQuiz();
+  q.fb = { id, ans, kind, note, mode }; q.done[id] = kind; paintQuiz();
 }
 
 // Writes the answer on screen into the learning history. Runs when moving on, so that
@@ -650,17 +662,17 @@ async function submitAns(giveUp) {
 function commitFb() {
   const q = vq, fb = q && q.fb; if (!fb || fb.checking) return;
   const c = byId(fb.id), secondTry = fb.id in q.first;
-  if (c) record(c, fb.kind, fb.ans, q.p.src === 'none' ? 'no text' : q.p.src + (q.p.url ? ': ' + q.p.title : ''), secondTry);
+  if (c) record(c, fb.kind, fb.ans, q.p ? q.p.src + (q.p.url ? ': ' + q.p.title : '') : '', fb.mode, secondTry);
   if (!secondTry) q.first[fb.id] = fb.kind;
-  q.pending = q.pending.filter(x => x !== fb.id);
+  q.pending = q.pending.filter(x => x !== fb.id); q.quick = q.quick.filter(x => x !== fb.id);
   if (fb.kind !== 'ok' && !q.retried.has(fb.id) && c) { q.retried.add(fb.id); q.retry.push(fb.id); }
   q.fb = null; save();
 }
 
 function qNext() {
   const q = vq; commitFb();
-  const nxt = q.p.targets.find(x => !q.done[x.id]);
-  if (nxt) { q.active = nxt.id; paintQuiz(); } else nextPassage();
+  const nxt = q.p && q.p.targets.find(x => !q.done[x.id]);
+  if (nxt) { q.active = nxt.id; paintQuiz(); } else advance();
 }
 
 function finishVocab() {
@@ -682,7 +694,7 @@ function finishVocab() {
 let reader = null;
 function startReader(id) {
   const c = byId(id); if (!c) return;
-  sess = null; drill = null; vq = null;
+  vq = null;
   reader = { id, p: null, loading: true, shown: false, used: new Set(), tick: 0 };
   closeSheet(); loadReader();
 }
@@ -695,225 +707,19 @@ async function loadReader() {
 function paintReader() {
   const r = reader, c = byId(r.id), p = r.p;
   const body = r.loading ? `<div class="stage"><div class="spinner"></div><p class="muted">Finding a Danish text</p></div>`
-    : `<div class="stage top read"><p class="source">${srcLine(p)}</p><div class="reading ${p.src === 'none' ? 'solo' : ''}" lang="da">${markup(p, () => 'm-active')}</div>
+    : p.src === 'none' ? `<div class="stage"><h2>No text found</h2><p class="muted">Nothing turned up for “${esc(c.da)}” right now. Check the connection or the spelling.</p></div>`
+    : `<div class="stage top read"><p class="source">${srcLine(p)}</p><div class="reading" lang="da">${markup(p, () => 'm-active')}</div>
       ${r.shown ? `<div class="ans"><p><b>${esc(c.da)}</b> — ${esc(c.en)}</p></div>` : `<button class="btn ghost block" data-a="rShow">Show meaning</button>`}</div>`;
-  overlay.innerHTML = ohead(null, 'Reading') + body + `<div class="foot">${r.loading ? '' : `<div class="two"><button class="btn tint" data-a="say" data-t="${esc(p.text)}">Listen</button><button class="btn primary" data-a="rAgain">Another text</button></div>`}</div>`;
+  overlay.innerHTML = ohead(null, 'Reading') + body + `<div class="foot">${r.loading ? '' : `<div class="two"><button class="btn tint" data-a="say" data-t="${esc(p.src === 'none' ? c.da : p.text)}">Listen</button><button class="btn primary" data-a="rAgain">Another text</button></div>`}</div>`;
   overlay.hidden = false;
-}
-
-// ═════════ Course session (flashcard-style spaced repetition) ═════════
-let sess = null;
-
-function nextIv(st, g, relearn) {
-  if (!st || relearn) return g === 'easy' && !relearn ? 3 : 1;
-  if (g === 'easy') return Math.max(4, Math.round(Math.max(st.iv, 1) * st.ef * 1.3));
-  return st.iv < 1 ? 1 : st.iv < 3 ? 3 : Math.round(st.iv * st.ef);
-}
-
-function startSession(o = {}) {
-  let due = dueIds(), pool, nNew, practice = false;
-  if (o.unit) { pool = UNIT[o.unit].items; due = due.filter(id => ITEM[id].unit === o.unit); nNew = 6; }
-  else { pool = modItems(S.module); nNew = o.extra || Math.max(0, S.newPerDay - day().new); }
-  due = due.sort((a, b) => S.items[a].due < S.items[b].due ? -1 : 1).slice(0, 60);
-  const fr = pool.filter(it => !S.items[it.id]).slice(0, nNew);
-  if (o.unit && !due.length && !fr.length) { practice = true; due = shuffle(pool.map(i => i.id)); }
-  if (!due.length && !fr.length) { toast('Nothing to study right now'); return; }
-
-  // New words arrive four at a time: meet them, recognise them, then recall them at the end.
-  const q = [], rev = due.map(id => ({ t: 'card', id }));
-  for (let i = 0; i < fr.length; i += 4) {
-    const b = fr.slice(i, i + 4);
-    b.forEach(it => q.push({ t: 'intro', id: it.id }));
-    shuffle(b).forEach(it => q.push({ t: 'mcq', id: it.id }));
-    q.push(...rev.splice(0, 4));
-  }
-  q.push(...rev);
-  fr.forEach(it => q.push({ t: 'card', id: it.id, isNew: true }));
-  reader = null; drill = null; vq = null;
-  sess = { q, i: 0, start: Date.now(), st: { rev: 0, ok: 0, new: 0 }, practice, revealed: false, picked: null, tick: 0 };
-  closeSheet(); paintSess(true);
-}
-
-const requeue = c => sess.q.splice(Math.min(sess.q.length, sess.i + 4), 0, c);
-function nextCard() { sess.i++; sess.revealed = false; sess.picked = null; sess.tick++; paintSess(true); }
-const ohead = (pct, right) => `<div class="ohead"><button class="x" data-a="closeOverlay" aria-label="Close">✕</button>${pct === null ? '<span class="grow"></span>' : `<div class="prog"><i style="width:${pct}%"></i></div>`}<span class="count">${right}</span></div>`;
-const exBlock = it => it.ex ? `<div class="ex">${spk(it.ex, 'sm')}<span class="grow"><b>${esc(it.ex)}</b><small>${esc(it.exEn)}</small></span></div>` : '';
-const play = t => `<div class="play">${spk(t, 'big')}</div>${slowBtn(t)}`;
-
-function paintSess(auto) {
-  const c = sess.q[sess.i];
-  if (!c) return finishSess();
-  const it = ITEM[c.id], st = S.items[c.id], voice = hasVoice();
-  let body = '', foot = '', say = '';
-  if (c.t === 'intro') {
-    body = `<span class="badge">New word</span><div class="word">${esc(it.da)}</div>${play(it.da)}<div class="gloss">${esc(it.en)}</div>${exBlock(it)}`;
-    foot = `<button class="btn primary block" data-a="next">Continue</button><button class="btn ghost block" data-a="knowIt">I already know this</button>`;
-    say = it.da;
-  } else if (c.t === 'mcq') {
-    if (!c.opts) c.opts = shuffle([it, ...shuffle(modItems(it.m).filter(x => x.en !== it.en)).slice(0, 3)]).map(x => x.id);
-    const ans = sess.picked !== null;
-    body = `<span class="badge">What does it mean?</span>${play(it.da)}
-      <div class="word ${voice && !ans ? 'veil' : ''}">${esc(it.da)}</div>
-      <div class="opts">${c.opts.map(id => `<button class="opt ${ans ? (id === c.id ? 'ok' : id === sess.picked ? 'bad' : 'dim') : ''}" data-a="pick" data-id="${id}" ${ans ? 'disabled' : ''}>${esc(ITEM[id].en)}</button>`).join('')}</div>`;
-    if (ans && sess.picked !== c.id) foot = `<button class="btn primary block" data-a="next">Continue</button>`;
-    say = it.da;
-  } else {
-    const listen = !c.isNew && st && st.reps % 2 === 1;
-    if (!sess.revealed) {
-      body = listen
-        ? `<span class="badge">Listen. What does it mean?</span>${play(it.da)}${voice ? '' : `<div class="word">${esc(it.da)}</div>`}`
-        : `<span class="badge">Say it in Danish</span><div class="word en">${esc(it.en)}</div>`;
-      foot = `<button class="btn primary block" data-a="reveal">Show answer</button>`;
-      if (listen) say = it.da;
-    } else {
-      body = `<div class="word">${esc(it.da)}</div>${play(it.da)}<div class="gloss">${esc(it.en)}</div>${exBlock(it)}`;
-      const lbl = g => sess.practice ? '' : `<small>${g === 'again' ? 'soon' : fmtIv(nextIv(st, g, c.relearn))}</small>`;
-      foot = `<div class="grades"><button class="g again" data-a="grade" data-g="again">Forgot${lbl('again')}</button><button class="g good" data-a="grade" data-g="good">Got it${lbl('good')}</button><button class="g easy" data-a="grade" data-g="easy">Easy${lbl('easy')}</button></div>`;
-      if (auto) say = it.da;
-    }
-  }
-  overlay.innerHTML = ohead(Math.round(sess.i / sess.q.length * 100), sess.q.length - sess.i) + `<div class="stage">${body}</div><div class="foot">${foot}</div>`;
-  overlay.hidden = false;
-  if (auto && say) speak(say);
-}
-
-function pickOpt(id) {
-  const c = sess.q[sess.i]; if (sess.picked !== null) return;
-  sess.picked = id; paintSess(false);
-  if (id === c.id) { const k = sess.tick; setTimeout(() => { if (sess && sess.tick === k) nextCard(); }, 700); }
-  else { requeue({ t: 'mcq', id: c.id }); speak(ITEM[c.id].da); }
-}
-
-function knowIt() {
-  const id = sess.q[sess.i].id, t = today();
-  S.items[id] = { iv: 30, ef: 2.5, due: addDays(t, 30), reps: 2, lapses: 0, first: t };
-  sess.q = sess.q.filter((c, i) => i <= sess.i || c.id !== id);
-  save(); nextCard();
-}
-
-function grade(g) {
-  const c = sess.q[sess.i], id = c.id, st = S.items[id], t = today();
-  if (sess.practice) { if (g === 'again') requeue({ t: 'card', id }); return nextCard(); }
-  if (!c.relearn && !c.isNew) { sess.st.rev++; day().rev++; if (g !== 'again') { sess.st.ok++; day().ok++; } }
-  if (g === 'again') {
-    if (st && !c.relearn) { st.lapses++; st.ef = Math.max(1.3, st.ef - 0.2); st.iv = 0; st.due = t; }
-    requeue({ t: 'card', id, isNew: c.isNew, relearn: true });
-  } else {
-    const iv = nextIv(st, g, c.relearn);
-    if (!st) { S.items[id] = { iv, ef: 2.5, due: addDays(t, iv), reps: 1, lapses: 0, first: t }; day().new++; sess.st.new++; }
-    else { st.iv = iv; if (g === 'easy' && !c.relearn) st.ef = Math.min(3, st.ef + 0.1); st.reps++; st.due = addDays(t, iv); }
-  }
-  save(); nextCard();
-}
-
-function logTime(start) { day().sec += Math.min(1800, Math.round((Date.now() - start) / 1000)); save(); }
-
-function finishSess() {
-  const s = sess.st, mins = Math.max(1, Math.round((Date.now() - sess.start) / 60000));
-  logTime(sess.start); sess = null;
-  overlay.innerHTML = `<div class="stage done">${CHECK}<h1>Godt klaret</h1><p class="muted">That course session is complete.</p>
-    <div class="stats three"><div class="stat"><b>${s.new}</b><small>new words</small></div><div class="stat"><b>${s.rev}</b><small>reviewed</small></div><div class="stat"><b>${mins}</b><small>min</small></div></div></div>
-    <div class="foot"><button class="btn primary block" data-a="closeOverlay">Done</button></div>`;
 }
 
 function closeOverlay() {
-  // Leaving a vocabulary session early still shows what was answered.
+  // Leaving a session early still shows what was answered.
   if (vq && !vq.finished && (Object.keys(vq.first).length || (vq.fb && !vq.fb.checking))) return finishVocab();
-  vq = null;
-  if (sess) { logTime(sess.start); sess = null; }
-  if (drill) { logTime(drill.start); drill = null; }
-  reader = null;
+  vq = null; reader = null;
   if (canSpeak) speechSynthesis.cancel();
   overlay.hidden = true; overlay.innerHTML = ''; render();
-}
-
-// ═════════ Drills ═════════
-let drill = null;
-const ONES = ['nul', 'en', 'to', 'tre', 'fire', 'fem', 'seks', 'syv', 'otte', 'ni', 'ti', 'elleve', 'tolv', 'tretten', 'fjorten', 'femten', 'seksten', 'sytten', 'atten', 'nitten'];
-const TENS = { 20: 'tyve', 30: 'tredive', 40: 'fyrre', 50: 'halvtreds', 60: 'tres', 70: 'halvfjerds', 80: 'firs', 90: 'halvfems' };
-function daNum(n) {
-  if (n < 20) return ONES[n];
-  if (n < 100) { const o = n % 10; return o ? ONES[o] + 'og' + TENS[n - o] : TENS[n]; }
-  const h = Math.floor(n / 100), r = n % 100, hs = (h === 1 ? 'et' : ONES[h]) + ' hundrede';
-  return r ? hs + ' og ' + daNum(r) : hs;
-}
-const norm = s => s.toLowerCase().replace(/[.,!?]/g, '').replace(/\s+/g, ' ').trim();
-const PROPER = /^(Danmark|Anna|Peter|Aarhus|København|Jylland|Odense|Skagen)/;
-
-function startDrill(kind) {
-  if ((kind === 'pairs') && !hasVoice()) { toast('This drill needs a Danish voice on the device'); return; }
-  const known = Object.keys(S.items).map(id => ITEM[id]).filter(Boolean);
-  let pool = [...new Set([...known, ...modItems(S.module)])], qs;
-  if (kind === 'pairs') qs = shuffle(PAIRS).slice(0, 10).map(p => ({ p, target: rnd(0, 1) }));
-  else if (kind === 'numbers') qs = shuffle([rnd(20, 49), rnd(20, 49), rnd(50, 99), rnd(50, 99), rnd(50, 99), rnd(50, 99), rnd(50, 99), rnd(100, 999), rnd(100, 999), rnd(100, 999)]).map(n => ({ n }));
-  else if (kind === 'gender') {
-    const noun = x => /^(en|et) \S+$/.test(x.da);
-    let ns = pool.filter(noun); if (ns.length < 10) ns = [...new Set([...ns, ...modItems(1).filter(noun)])];
-    qs = shuffle(ns).slice(0, 10).map(it => ({ it }));
-  } else {
-    const fits = x => { const n = x.ex.split(' ').length; return n >= 4 && n <= 8; };
-    let ss = pool.filter(fits); if (ss.length < 6) ss = [...new Set([...ss, ...modItems(1).filter(fits)])];
-    qs = shuffle(ss).slice(0, 6).map(it => {
-      const w = it.ex.replace(/[.!?]$/, '').split(' ');
-      if (!PROPER.test(w[0])) w[0] = w[0].toLowerCase();
-      return { it, toks: shuffle(w.map((t, i) => ({ t, i }))), picked: [] };
-    });
-  }
-  sess = null; reader = null; vq = null;
-  drill = { kind, qs, i: 0, ok: 0, fb: null, input: '', start: Date.now(), tick: 0 };
-  closeSheet(); paintDrill(true);
-}
-
-function paintDrill(auto) {
-  const q = drill.qs[drill.i];
-  if (!q) return finishDrill();
-  const k = drill.kind, fb = drill.fb, voice = hasVoice();
-  let body = '', foot = '', say = '';
-  if (k === 'pairs') {
-    const [a, ae, b, be, tag] = q.p, w = [[a, ae], [b, be]];
-    body = `<span class="badge">${esc(tag)} · which word did you hear?</span>${play(w[q.target][0])}
-      <div class="choices">${w.map((x, i) => `<button class="choice ${fb ? (i === q.target ? 'ok' : i === fb.pick ? 'bad' : '') : ''}" data-a="${fb ? 'say' : 'dPick'}" data-i="${i}" data-t="${esc(x[0])}"><b>${esc(x[0])}</b><small>${esc(x[1])}</small></button>`).join('')}</div>
-      ${fb ? '<p class="muted center">Tap either word to hear it again.</p>' : ''}`;
-    say = w[q.target][0];
-  } else if (k === 'numbers') {
-    const word = daNum(q.n);
-    body = `<span class="badge">Type the number you hear</span>${play(word)}
-      ${voice ? '' : `<div class="gloss">${esc(word)}</div>`}
-      <div class="digits ${fb ? (fb.ok ? 'ok' : 'bad') : ''}">${esc(drill.input) || '&nbsp;'}</div>
-      ${fb ? `<div class="gloss"><b>${q.n}</b> · ${esc(word)}</div>` : `<div class="keypad">${[1, 2, 3, 4, 5, 6, 7, 8, 9, '⌫', 0, 'OK'].map(x => `<button data-a="key" data-k="${x}" class="${x === 'OK' ? 'go' : ''}">${x}</button>`).join('')}</div>`}`;
-    say = word;
-  } else if (k === 'gender') {
-    const [art, noun] = q.it.da.split(' ');
-    body = `<span class="badge">En or et?</span><div class="word">${fb ? esc(q.it.da) : '<span class="blank">__</span> ' + esc(noun)}</div><div class="gloss">${esc(q.it.en)}</div>
-      <div class="choices">${['en', 'et'].map(x => `<button class="choice ${fb ? (x === art ? 'ok' : x === fb.pick ? 'bad' : '') : ''}" data-a="dPick" data-i="${x}" ${fb ? 'disabled' : ''}><b>${x}</b></button>`).join('')}</div>`;
-  } else {
-    const used = new Set(q.picked);
-    body = `<span class="badge">Build the sentence</span><div class="gloss lead">${esc(q.it.exEn)}</div>
-      <div class="answer ${fb ? (fb.ok ? 'ok' : 'bad') : ''}">${q.picked.map(i => `<button class="tok" data-a="unTok" data-i="${i}" ${fb ? 'disabled' : ''}>${esc(q.toks.find(t => t.i === i).t)}</button>`).join('') || '<span class="hint">Tap the words in order</span>'}</div>
-      ${fb ? `<div class="ex">${spk(q.it.ex, 'sm')}<span class="grow"><b>${esc(q.it.ex)}</b></span></div>` : `<div class="tokens">${q.toks.map(t => `<button class="tok ${used.has(t.i) ? 'used' : ''}" data-a="tok" data-i="${t.i}" ${used.has(t.i) ? 'disabled' : ''}>${esc(t.t)}</button>`).join('')}</div>`}`;
-    if (!fb) foot = `<button class="btn primary block" data-a="dCheck" ${q.picked.length === q.toks.length ? '' : 'disabled'}>Check</button>`;
-  }
-  if (fb && !(fb.ok && k !== 'build')) foot = `<div class="fb ${fb.ok ? 'ok' : 'bad'}">${fb.ok ? 'Rigtigt' : 'Not quite'}</div><button class="btn primary block" data-a="dNext">Continue</button>`;
-  else if (fb) foot = `<div class="fb ok">Rigtigt</div>`;
-  overlay.innerHTML = ohead(Math.round(drill.i / drill.qs.length * 100), drill.qs.length - drill.i) + `<div class="stage">${body}</div><div class="foot">${foot}</div>`;
-  overlay.hidden = false;
-  if (auto && say && !fb) speak(say);
-}
-
-function drillAnswer(ok, picked) {
-  const k = drill.kind, d = day(), s = S.drills[k] = S.drills[k] || { n: 0, ok: 0 };
-  drill.fb = { ok, pick: picked }; if (ok) { drill.ok++; d.dok++; s.ok++; } d.drill++; s.n++; save();
-  paintDrill(false);
-  const q = drill.qs[drill.i];
-  if (k === 'gender') speak(q.it.da); else if (k === 'build') speak(q.it.ex);
-  if (ok && k !== 'build') { const t = drill.tick; setTimeout(() => { if (drill && drill.tick === t) drillNext(); }, 900); }
-}
-function drillNext() { drill.i++; drill.fb = null; drill.input = ''; drill.tick++; paintDrill(true); }
-function finishDrill() {
-  const d = drill, pct = Math.round(d.ok / d.qs.length * 100);
-  logTime(d.start); drill = null;
-  overlay.innerHTML = `<div class="stage done">${CHECK}<h1>${d.ok} / ${d.qs.length}</h1><p class="muted">${DRILLS[d.kind].name} · ${pct}% correct</p></div>
-    <div class="foot"><button class="btn tint block" data-a="drill" data-k="${d.kind}">Go again</button><button class="btn primary block" data-a="closeOverlay">Done</button></div>`;
 }
 
 // ═════════ Adding and editing words ═════════
@@ -945,7 +751,7 @@ async function shareFile(name, data, type) {
   return true;
 }
 async function exportBackup() {
-  const ok = await shareFile(`dansk-backup-${today()}.json`, JSON.stringify({ app: 'dansk', v: 2, exported: new Date().toISOString(), state: S }), 'application/json');
+  const ok = await shareFile(`dansk-backup-${today()}.json`, JSON.stringify({ app: 'dansk', v: 3, exported: new Date().toISOString(), state: S }), 'application/json');
   if (ok) { S.lastBackup = today(); save(); if (overlay.hidden) render(); toast('Backup saved'); }
 }
 function exportCSV() {
@@ -961,9 +767,9 @@ function readImport(file) {
   r.onload = () => {
     try {
       const b = JSON.parse(r.result), st = b && b.state;
-      if (!b || b.app !== 'dansk' || !st || typeof st.items !== 'object' || typeof st.days !== 'object') throw 0;
+      if (!b || b.app !== 'dansk' || !st || typeof st !== 'object') throw 0;
       pendingImport = st;
-      confirmSheet('Restore this backup?', `Backup from <b>${esc((b.exported || '').slice(0, 10) || 'unknown date')}</b> with <b>${(st.custom || []).length}</b> vocabulary words and <b>${Object.keys(st.items).length}</b> course words.<br>This phone currently has <b>${S.custom.length}</b> and <b>${Object.keys(S.items).length}</b>. Restoring replaces what is on this phone.`, 'Replace and restore', 'doImport', true);
+      confirmSheet('Restore this backup?', `Backup from <b>${esc((b.exported || '').slice(0, 10) || 'unknown date')}</b> with <b>${(st.custom || []).length}</b> words.<br>This phone currently has <b>${S.custom.length}</b>. Restoring replaces what is on this phone.`, 'Replace and restore', 'doImport', true);
     } catch (e) { toast('That file is not a Dansk backup'); }
   };
   r.readAsText(file);
@@ -971,17 +777,20 @@ function readImport(file) {
 
 // ═════════ Events ═════════
 const A = {
-  tab: el => { tab = el.dataset.tab; if (tab === 'course') viewMod = S.module; render(); window.scrollTo(0, 0); },
-  say: el => speak(el.dataset.t, !!el.dataset.slow),
+  tab: el => { tab = el.dataset.tab; render(); window.scrollTo(0, 0); },
+  say: el => speak(el.dataset.t),
   closeSheet, closeOverlay,
-  obNext: () => { obStep = 1; render(); },
-  obPick: el => { const m = Number(el.dataset.m); S.module = viewMod = m; for (let i = 1; i < m; i++) markKnown(i); S.onboarded = true; save(); render(); },
+  obDone: () => { S.onboarded = true; save(); render(); },
   hintOff: () => { S.hintOff = true; save(); render(); },
-  // vocabulary
   vStart: () => startVocab(false),
   vAhead: () => startVocab(true),
-  vBegin: () => nextPassage(),
-  qPick: el => { const q = vq; if (!q || !q.p) { if (reader && !reader.shown) { reader.shown = true; paintReader(); } return; } const id = el.dataset.id; if (q.done[id] && !(q.fb && q.fb.id === id)) return; if (q.fb && q.fb.checking) return; if (q.fb && q.fb.id !== id) commitFb(); if (!q.done[id]) { q.active = id; paintQuiz(); } },
+  vBegin: () => advance(),
+  qPick: el => {
+    const q = vq; if (!q || !q.p) { if (reader && !reader.shown) { reader.shown = true; paintReader(); } return; }
+    const id = el.dataset.id; if (q.done[id] || (q.fb && q.fb.checking)) return;
+    if (q.fb) commitFb();
+    q.active = id; paintQuiz();
+  },
   qSubmit: () => submitAns(false),
   qSkip: () => submitAns(true),
   qOver: () => { const q = vq; if (!q.fb) return; q.fb.kind = 'ok'; q.fb.note = ''; q.done[q.fb.id] = 'ok'; paintQuiz(); },
@@ -991,37 +800,15 @@ const A = {
   saveWord: el => saveWord(el.dataset.id),
   bulk: () => bulkSheet(''),
   bulkReview,
-  bulkBack: () => bulkSheet(bulkSheet.text),
+  bulkBack: () => bulkSheet(bulkText),
   bulkSave: () => { const add = bulkParsed.filter(p => !p.dup); add.forEach(p => S.custom.push({ id: newId(), da: p.da, en: p.en, notes: '', added: today() })); bulkParsed = []; save(); closeSheet(); render(); toast(`${add.length} ${add.length === 1 ? 'word' : 'words'} added`); },
   read: el => startReader(el.dataset.id),
   rShow: () => { if (reader && !reader.shown) { reader.shown = true; paintReader(); } },
   rAgain: () => loadReader(),
   askDelWord: el => { pendingId = el.dataset.id; confirmSheet('Delete this word?', 'The word and its learning history are removed from this phone.', 'Delete word', 'doDelWord', true); },
   doDelWord: () => { S.custom = S.custom.filter(c => c.id !== pendingId); delete S.vs[pendingId]; save(); closeSheet(); render(); },
-  // course
-  start: () => startSession(),
-  more: () => startSession({ extra: 5 }),
-  viewMod: el => { viewMod = Number(el.dataset.m); render(); },
-  setMod: () => { S.module = viewMod; save(); render(); toast(`${MOD(viewMod).name} is now your current module`); },
-  askKnown: () => confirmSheet(`Mark ${MOD(viewMod).name} as known?`, 'Every word in this module you have not studied yet is marked as known. They will still come back for an occasional review, a few per day.', 'Mark as known', 'doKnown'),
-  doKnown: () => { markKnown(viewMod); save(); closeSheet(); render(); toast(`${MOD(viewMod).name} marked as known`); },
-  unit: el => unitSheet(el.dataset.u),
-  studyUnit: el => startSession({ unit: el.dataset.u }),
-  next: () => nextCard(),
-  knowIt,
-  reveal: () => { sess.revealed = true; paintSess(true); },
-  pick: el => pickOpt(el.dataset.id),
-  grade: el => grade(el.dataset.g),
-  drill: el => startDrill(el.dataset.k),
-  dPick: el => { const q = drill.qs[drill.i]; if (drill.fb) return; if (drill.kind === 'pairs') { const i = Number(el.dataset.i); drillAnswer(i === q.target, i); } else { const x = el.dataset.i; drillAnswer(x === q.it.da.split(' ')[0], x); } },
-  key: el => { const k = el.dataset.k, q = drill.qs[drill.i]; if (k === '⌫') drill.input = drill.input.slice(0, -1); else if (k === 'OK') { if (drill.input) return drillAnswer(Number(drill.input) === q.n); } else if (drill.input.length < 4) drill.input += k; paintDrill(false); },
-  tok: el => { drill.qs[drill.i].picked.push(Number(el.dataset.i)); paintDrill(false); },
-  unTok: el => { const q = drill.qs[drill.i]; q.picked = q.picked.filter(i => i !== Number(el.dataset.i)); paintDrill(false); },
-  dCheck: () => { const q = drill.qs[drill.i]; drillAnswer(norm(q.picked.map(i => q.toks.find(t => t.i === i).t).join(' ')) === norm(q.it.ex)); },
-  dNext: () => drillNext(),
-  // settings
+  mode: el => { const m = el.dataset.m, on = Object.keys(MODES).filter(k => S.cfg.modes[k]); if (S.cfg.modes[m] && on.length === 1) { toast('Keep at least one exercise on'); return; } S.cfg.modes[m] = !S.cfg.modes[m]; save(); render(); },
   mins: el => { S.cfg.minutes = Math.min(45, Math.max(5, S.cfg.minutes + Number(el.dataset.d))); save(); render(); },
-  npd: el => { S.newPerDay = Math.min(20, Math.max(2, S.newPerDay + Number(el.dataset.d))); save(); render(); },
   slow: () => { S.slow = !S.slow; save(); render(); speak('Hej, hvordan går det?'); },
   aiSave: () => { const k = $('#aiKey').value.trim(); if (!k) { $('#aiKey').focus(); return; } try { localStorage.setItem(AI_KEY, k); } catch (e) { toast('Could not save the key'); return; } aiClient = null; aiWarned = false; render(); toast('Key saved on this phone'); },
   aiRemove: () => { localStorage.removeItem(AI_KEY); aiClient = null; render(); toast('Key removed'); },
@@ -1029,9 +816,9 @@ const A = {
   export: () => exportBackup(),
   csv: () => exportCSV(),
   import: () => { const f = $('#file'); f.value = ''; f.click(); },
-  doImport: () => { if (!pendingImport) return; S = migrate(Object.assign(fresh(), pendingImport, { onboarded: true })); pendingImport = null; viewMod = S.module; save(); closeSheet(); render(); toast('Backup restored'); },
+  doImport: () => { if (!pendingImport) return; S = migrate(Object.assign(fresh(), pendingImport, { onboarded: true })); pendingImport = null; save(); closeSheet(); render(); toast('Backup restored'); },
   askReset: () => confirmSheet('Erase everything?', 'Your vocabulary, all learning history and your settings will be removed from this phone. This cannot be undone unless you have a backup file.', 'Erase everything', 'doReset', true),
-  doReset: () => { S = fresh(); save(); obStep = 0; tab = 'today'; closeSheet(); render(); }
+  doReset: () => { S = fresh(); save(); tab = 'today'; closeSheet(); render(); }
 };
 
 document.addEventListener('click', e => {

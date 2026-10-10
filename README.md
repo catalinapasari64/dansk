@@ -2,6 +2,7 @@
 
 A personal Danish vocabulary app. You add the words you want to learn with your own
 translations; the app tests them inside short Danish texts and spaces the reviews.
+There is no built-in course: every exercise is built from your own words.
 
 Live at https://catalinapasari64.github.io/dansk/ (open in Safari on iPhone, then Share → Add to Home Screen).
 
@@ -10,6 +11,7 @@ Live at https://catalinapasari64.github.io/dansk/ (open in Safari on iPhone, the
 - **Storage:** everything lives in the browser's local storage on the device. There is no server and no account. Use Settings → Save backup file to keep a copy.
 - **Texts:** DR news snippets (collected daily into `news.json` by a GitHub Actions job from DR's public RSS feeds), then Danish Wikipedia and Tatoeba, each with a link to the source. Passages are at most five sentences.
 - **Scheduling:** rule-based. A correct answer moves a word along the intervals in Settings (2, 4, 10, 20, 40, 80, 160 days by default); a miss brings it back the next day.
+- **Exercises:** each review of a word uses the next of four types: meaning in a text, fill the gap in a text, Danish to English, English to Danish. Types can be switched off in Settings.
 - **Answer checking:** matched against your translations (alternatives separated by `;`), allowing small typos and different word endings. "My answer was right" overrides a wrong verdict.
 
 ## Optional: AI assistance

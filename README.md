@@ -8,7 +8,7 @@ Live at https://catalinapasari64.github.io/dansk/ (open in Safari on iPhone, the
 ## How it works
 
 - **Storage:** everything lives in the browser's local storage on the device. There is no server and no account. Use Settings → Save backup file to keep a copy.
-- **Texts:** fetched live from Danish Wikipedia and Tatoeba, with a link to the source. Passages are at most five sentences.
+- **Texts:** DR news snippets (collected daily into `news.json` by a GitHub Actions job from DR's public RSS feeds), then Danish Wikipedia and Tatoeba, each with a link to the source. Passages are at most five sentences.
 - **Scheduling:** rule-based. A correct answer moves a word along the intervals in Settings (2, 4, 10, 20, 40, 80, 160 days by default); a miss brings it back the next day.
 - **Answer checking:** matched against your translations (alternatives separated by `;`), allowing small typos and different word endings. "My answer was right" overrides a wrong verdict.
 

@@ -368,8 +368,9 @@ function rx(c) {
   const term = termOf(c.da); let core;
   if (/\s/.test(term)) core = term.split(/\s+/).map(reEsc).join('\\s+');
   else {
-    const stem = term.length > 3 && term.endsWith('e') ? term.slice(0, -1) : term, last = stem.slice(-1);
-    core = reEsc(stem) + (/[bdfgklmnprst]/.test(last) ? last + '?' : '') + '(?:e|en|et|er|ene|erne|ne|r|te|t|ede|de|ende|ere|est|este)?s?';
+    // A word ending in -e is matched on its stem, which then needs an ending: "mene" must not match "men".
+    const cut = term.length > 3 && term.endsWith('e'), stem = cut ? term.slice(0, -1) : term, last = stem.slice(-1);
+    core = reEsc(stem) + (/[bdfgklmnprst]/.test(last) ? last + '?' : '') + '(?:e|en|et|er|ene|erne|ne|r|te|t|ede|de|ende|ere|est|este)' + (cut ? '' : '?') + 's?';
   }
   const re = new RegExp('(^|[^\\p{L}])(' + core + ')(?=$|[^\\p{L}])', 'iu');
   RX[c.id] = { da: c.da, re };
@@ -424,12 +425,29 @@ function bestWindow(text, cands, primary, wanted, used) {
 }
 
 const WIKI = 'https://da.wikipedia.org/w/api.php?format=json&origin=*&action=query';
+let NEWS = null;
+async function loadNews() {
+  if (NEWS) return NEWS;
+  try { NEWS = (await getJSON('news.json')).items || []; return NEWS; } catch (e) { return []; }
+}
 async function buildPassage(ids, eligible, used) {
   const words = ids.map(byId).filter(Boolean), primary = words[0];
   const cands = S.custom.filter(c => eligible(c.id)), wanted = new Set(ids);
-  let best = null;
-  // 1. Wikipedia: first look for articles that contain several of the wanted words.
-  try {
+  let best = null, newsHit = null;
+  // 1. DR news snippets collected daily into news.json (no network search needed).
+  const hits = [];
+  (await loadNews()).forEach(it => {
+    if (used.has(it.x) || !rx(primary).test(it.x)) return;
+    const targets = locate(it.x, cands); if (!targets.some(t => t.id === primary.id)) return;
+    hits.push({ text: it.x, targets, pend: targets.filter(t => wanted.has(t.id)).length, src: 'DR', title: it.t, url: it.u });
+  });
+  if (hits.length) {
+    const top = Math.max(...hits.map(h => h.pend)); newsHit = shuffle(hits.filter(h => h.pend === top))[0];
+    // A news snippet is short, so now and then look further for a text holding more of the words.
+    if (top >= 2 || words.length === 1 || Math.random() < 0.7) best = newsHit;
+  }
+  // 2. Wikipedia: look for articles that contain several of the wanted words.
+  if (!best) try {
     const others = shuffle(words.slice(1)), combos = [];
     if (others.length >= 2) combos.push([primary, others[0], others[1]]);
     if (others.length >= 1) combos.push([primary, others[others.length - 1]]);
@@ -447,14 +465,15 @@ async function buildPassage(ids, eligible, used) {
       if (best && best.pend >= Math.min(2, combo.length)) break;
     }
   } catch (e) { /* offline or blocked: fall through */ }
-  // 2. Tatoeba example sentences.
+  if (newsHit && (!best || best.pend < 2)) best = newsHit;
+  // 3. Tatoeba example sentences.
   if (!best) try {
     const term = termOf(primary.da);
     const j = await getJSON(`https://api.tatoeba.org/unstable/sentences?lang=dan&sort=random&limit=12&q=${encodeURIComponent(term)}`);
     const ss = [...new Set((j.data || []).map(s => s.text).filter(s => s && s.length >= 20 && rx(primary).test(s)))].slice(0, 3), text = ss.join(' ');
     if (ss.length && !used.has(text)) best = { text, targets: locate(text, cands), src: 'Tatoeba', title: 'Example sentences', url: 'https://tatoeba.org/da/sentences/search?from=dan&query=' + encodeURIComponent(term) };
   } catch (e) { /* fall through */ }
-  // 3. A generated text, labelled as such.
+  // 4. A generated text, labelled as such.
   if (!best && hasAI()) try {
     const text = await aiPassage(words.slice(0, 5));
     if (text && rx(primary).test(text)) best = { text, targets: locate(text, cands), src: 'AI-generated', title: 'Written for this session, not a real source', url: '' };
